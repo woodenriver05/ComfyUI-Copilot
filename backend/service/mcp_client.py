@@ -13,7 +13,6 @@ from ..utils.globals import (
     get_comfyui_copilot_api_key,
     DISABLE_WORKFLOW_GEN,
 )
-from .. import core
 import asyncio
 from contextlib import AsyncExitStack
 import json
@@ -22,14 +21,8 @@ import traceback
 from typing import List, Dict, Any, Optional
 
 try:
-    from agents._config import set_default_openai_api
-    from agents.agent import Agent
-    from agents.items import ItemHelpers
     from agents.mcp import MCPServerSse
-    from agents.run import Runner
-    from agents.tracing import set_tracing_disabled
     from agents import handoff, RunContextWrapper, HandoffInputData
-    from agents.extensions import handoff_filters
     from agents.tool_context import ToolContext
     from agents.usage import Usage
 
@@ -44,6 +37,24 @@ except Exception:
     )
 
 from ..agent_factory import create_agent, diagnose_image, search_workflows
+from ..service.workflow_rewrite_tools import (
+    update_workflow,
+    search_node_local,
+    get_node_infos,
+    remove_node,
+)
+from ..service.workflow_rewrite_agent import get_rewrite_expert_by_name
+
+LOCAL_TOOLS_REGISTRY = {
+    "search_workflows": search_workflows,
+    "diagnose_image": diagnose_image,
+    "get_current_workflow": get_current_workflow,
+    "update_workflow": update_workflow,
+    "search_node_local": search_node_local,
+    "get_node_infos": get_node_infos,
+    "remove_node": remove_node,
+    "get_rewrite_expert_by_name": get_rewrite_expert_by_name,
+}
 from ..service.workflow_rewrite_agent import create_workflow_rewrite_agent
 from ..service.message_memory import message_memory_optimize
 from ..utils.request_context import get_rewrite_context, get_session_id, get_config
@@ -351,32 +362,25 @@ def _extract_json_object_slice(text: str, start_index: int) -> tuple[str, int]:
 
 
 def _extract_pseudo_tool_calls(text: str) -> List[Dict[str, Any]]:
-    tool_names = (
-        "recall_workflow",
-        "gen_workflow",
-        "search_workflows",
-        "diagnose_image",
-    )
     calls: List[Dict[str, Any]] = []
     cursor = 0
 
     while cursor < len(text):
-        next_match = None
-        next_tool_name = None
-
-        for tool_name in tool_names:
-            marker = f"{tool_name}[ARGS]"
-            position = text.find(marker, cursor)
-            if position == -1:
-                continue
-            if next_match is None or position < next_match:
-                next_match = position
-                next_tool_name = tool_name
-
-        if next_match is None or next_tool_name is None:
+        position = text.find("[ARGS]", cursor)
+        if position == -1:
             break
 
-        marker_end = next_match + len(next_tool_name) + len("[ARGS]")
+        # Find the tool name preceding [ARGS]
+        start_idx = position - 1
+        while start_idx >= 0 and (text[start_idx].isalnum() or text[start_idx] == '_'):
+            start_idx -= 1
+
+        tool_name = text[start_idx+1:position]
+        if not tool_name:
+            cursor = position + 6
+            continue
+
+        marker_end = position + 6
         json_start = marker_end
         while json_start < len(text) and text[json_start].isspace():
             json_start += 1
@@ -389,16 +393,16 @@ def _extract_pseudo_tool_calls(text: str) -> List[Dict[str, Any]]:
             raw_json, call_end = _extract_json_object_slice(text, json_start)
             calls.append(
                 {
-                    "name": next_tool_name,
+                    "name": tool_name,
                     "args": json.loads(raw_json),
-                    "start": next_match,
+                    "start": start_idx + 1,
                     "end": call_end,
                 }
             )
             cursor = call_end
         except Exception as parse_error:
             log.warning(
-                f"[MCP] Failed to parse pseudo tool call for {next_tool_name}: {parse_error}"
+                f"[MCP] Failed to parse pseudo tool call for {tool_name}: {parse_error}"
             )
             cursor = marker_end
 
@@ -487,7 +491,11 @@ def _parse_tool_result_payload(
         tool_ext = tool_output_data.get("ext")
         if isinstance(tool_ext, list):
             for ext_item in tool_ext:
-                if ext_item.get("type") in {"workflow_update", "param_update"}:
+                if ext_item.get("type") in {
+                    "workflow_update",
+                    "param_update",
+                    "workflow",
+                }:
                     workflow_update_ext = tool_ext
                     break
 
@@ -561,14 +569,10 @@ async def _bridge_pseudo_tool_calls(
             continue
 
         try:
-            if tool_name in ("search_workflows",):
-                query = str(tool_args.get("query") or "").strip()
-                log.info(
-                    f"[MCP] Bridging pseudo local tool '{tool_name}' with query: {query}"
-                )
-                local_tool = search_workflows
-                local_args = {"query": query}
-                local_json = json.dumps(local_args, ensure_ascii=False)
+            if tool_name in LOCAL_TOOLS_REGISTRY:
+                log.info(f"[MCP] Bridging pseudo local tool '{tool_name}' with args: {tool_args}")
+                local_tool = LOCAL_TOOLS_REGISTRY[tool_name]
+                local_json = json.dumps(tool_args, ensure_ascii=False)
                 local_ctx = ToolContext(
                     context=None,
                     usage=Usage(),
@@ -577,22 +581,6 @@ async def _bridge_pseudo_tool_calls(
                     tool_arguments=local_json,
                 )
                 raw_payload = await local_tool.on_invoke_tool(local_ctx, local_json)
-            elif tool_name == "diagnose_image":
-                image_path = str(tool_args.get("image_path") or "").strip()
-                question = str(tool_args.get("question") or "").strip()
-                log.info(
-                    f"[MCP] Bridging pseudo local tool 'diagnose_image' with image_path: {image_path}"
-                )
-                local_args = {"image_path": image_path, "question": question}
-                local_json = json.dumps(local_args, ensure_ascii=False)
-                local_ctx = ToolContext(
-                    context=None,
-                    usage=Usage(),
-                    tool_name=tool_name,
-                    tool_call_id=f"pseudo-{tool_name}",
-                    tool_arguments=local_json,
-                )
-                raw_payload = await diagnose_image.on_invoke_tool(local_ctx, local_json)
             else:
                 server = tool_server_map.get(tool_name)
                 if server is None:
@@ -645,7 +633,492 @@ async def _bridge_pseudo_tool_calls(
     return cleaned_text, workflow_update_ext, bridged_any
 
 
+import os
+import time
+import pathlib
+
+_LEGACY_AGENT_INVOKE = os.getenv("LEGACY_AGENT_INVOKE") == "1"
+
 async def comfyui_agent_invoke(
+    messages: List[Dict[str, Any]], images: List[ImageData] = None
+):
+    log.debug(f"[comfyui_agent_invoke] ENTER messages={len(messages)} images={len(images) if images else 0}")
+
+    capture_dir = pathlib.Path(__file__).parent.parent.parent / "tests" / "regression" / "golden" / "capture"
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    fn = capture_dir / f"{int(time.time()*1000)}.json"
+
+    capture = {
+        "input": {
+            "kwargs": {
+                "messages": messages,
+                "images": [{"url": getattr(img, "url", ""), "b64": "..." if getattr(img, "b64", None) else None} for img in images] if images else None
+            }
+        },
+        "expected_output": []
+    }
+
+    try:
+        if _LEGACY_AGENT_INVOKE:
+            generator = _legacy_comfyui_agent_invoke(messages, images)
+        else:
+            generator = _new_comfyui_agent_invoke(messages, images)
+
+        async for chunk in generator:
+            capture["expected_output"].append(chunk)
+            yield chunk
+
+        fn.write_text(json.dumps(capture, default=str, indent=2))
+        log.debug("[comfyui_agent_invoke] EXIT success")
+    except Exception as e:
+        log.error(f"[comfyui_agent_invoke] ERROR {e}")
+        capture["error"] = str(e)
+        fn.write_text(json.dumps(capture, default=str, indent=2))
+        raise
+
+# 1. Input Validation
+def _validate_invoke_input() -> tuple[str, dict]:
+    session_id = get_session_id()
+    if not session_id:
+        raise ValueError("No session_id found in request context")
+    config = get_config()
+    if not config:
+        raise ValueError("No config found in request context")
+    return session_id, config
+
+# 2. Context Preparation
+async def _prepare_invoke_context(messages: List[Dict[str, Any]], session_id: str) -> tuple[List[Dict[str, Any]], bool, Any]:
+    last_user_msg = _latest_user_message_text(messages)
+
+    if last_user_msg:
+        gen_keywords = ["만들", "생성", "그려", "추가", "바꿔", "수정", "create", "generate", "draw", "추천", "workflow", "워크플로우", "변경", "해줘"]
+        is_generation_intent = any(kw in last_user_msg.lower() for kw in gen_keywords)
+
+        if not is_generation_intent:
+            try:
+                log.info(f"[MCP] Routing simple chat directly to RAG agent for query: {last_user_msg}")
+                response_text = await pass_through_rag_agent(last_user_msg, session_id=session_id)
+                ext_with_finished = {"data": None, "finished": True}
+                return messages, True, (response_text, ext_with_finished)
+            except Exception as e:
+                log.error(f"[MCP] Error passing to RAG agent: {e}")
+        else:
+            log.info(f"[MCP] Keeping local tool path for action-oriented query: {last_user_msg[:160]}")
+
+    def _strip_trailing_whitespace(msgs):
+        cleaned = []
+        for msg in msgs:
+            role = msg.get("role")
+            if role != "assistant":
+                cleaned.append(msg)
+                continue
+            msg_copy = dict(msg)
+            content = msg_copy.get("content")
+            if isinstance(content, str):
+                msg_copy["content"] = content.rstrip()
+            elif isinstance(content, list):
+                new_content = []
+                for part in content:
+                    if isinstance(part, dict):
+                        part_copy = dict(part)
+                        text_val = part_copy.get("text")
+                        if isinstance(text_val, str):
+                            part_copy["text"] = text_val.rstrip()
+                        new_content.append(part_copy)
+                    else:
+                        new_content.append(part)
+                msg_copy["content"] = new_content
+            cleaned.append(msg_copy)
+        return cleaned
+
+    messages = _strip_trailing_whitespace(messages)
+    log.info(f"[MCP] Original messages count: {len(messages)}")
+    messages = message_memory_optimize(session_id, messages)
+    messages = _normalize_message_roles(messages)
+    log.info(f"[MCP] Optimized messages count: {len(messages)}")
+    return messages, False, None
+
+# 3. Setup Tool Loop (MCP + Handoff)
+async def _setup_tool_loop(messages: List[Dict[str, Any]], session_id: str, config: dict) -> tuple[Any, Any, Any]:
+    copilot_mcp_url = os.getenv("COPILOT_MCP_URL") or (BACKEND_BASE_URL + "/mcp-server/mcp")
+    copilot_headers = {"X-Session-Id": session_id}
+    internal_api_key = get_comfyui_copilot_api_key()
+    if internal_api_key:
+        copilot_headers["Authorization"] = f"Bearer {internal_api_key}"
+
+    mcp_server = MCPServerSse(
+        params={"url": copilot_mcp_url, "timeout": 300.0, "headers": copilot_headers},
+        cache_tools_list=True, client_session_timeout_seconds=300.0,
+    )
+    server_defs = [("copilot_mcp", mcp_server)]
+
+    if _should_attach_external_mcp(messages):
+        bing_mcp_url = (os.getenv("BING_MCP_URL") or BING_MCP_DEFAULT_URL).strip()
+        bing_mcp_api_key = (os.getenv("BING_MCP_API_KEY") or "").strip()
+        if bing_mcp_api_key:
+            bing_server = MCPServerSse(
+                params={"url": bing_mcp_url, "timeout": 300.0, "headers": {"Authorization": f"Bearer {bing_mcp_api_key}"}},
+                cache_tools_list=True, client_session_timeout_seconds=300.0,
+            )
+            server_defs.append(("bing_mcp", bing_server))
+
+    exit_stack, server_list = await _open_available_mcp_servers(server_defs)
+
+    workflow_rewrite_agent_instance = create_workflow_rewrite_agent()
+    class HandoffRewriteData(BaseModel):
+        latest_rewrite_intent: str
+
+    async def on_handoff(ctx, input_data: HandoffRewriteData):
+        get_rewrite_context().rewrite_intent = input_data.latest_rewrite_intent
+        log.info(f"Rewrite agent called with intent: {input_data.latest_rewrite_intent}")
+
+    def rewrite_handoff_input_filter(data: HandoffInputData) -> HandoffInputData:
+        intent = get_rewrite_context().rewrite_intent
+        new_history = ()
+        try:
+            for item in data.input_history:
+                if hasattr(item, "role") and getattr(item, "role") == "user":
+                    if hasattr(item, "model_copy"):
+                        new_history = (item.model_copy(update={"content": intent}),)
+                        break
+                    elif hasattr(item, "copy"):
+                        new_history = (item.copy(update={"content": intent}),)
+                        break
+        except Exception:
+            pass
+        return HandoffInputData(
+            input_history=new_history,
+            pre_handoff_items=(),
+            new_items=tuple(data.new_items),
+        )
+
+    handoff_rewrite = handoff(
+        agent=workflow_rewrite_agent_instance,
+        input_type=HandoffRewriteData,
+        input_filter=rewrite_handoff_input_filter,
+        on_handoff=on_handoff,
+    )
+
+    if DISABLE_WORKFLOW_GEN:
+        w_inst = "**CASE 3: SEARCH WORKFLOW**\nIF the user wants to find or generate a NEW workflow.\n- Keywords: \"create\", \"generate\", \"search\", \"find\", \"recommend\", \"生成\", \"查找\", \"推荐\".\n- Action: Use `recall_workflow`.\n"
+        w_cons = "- [Critical!] When the user's intent is to get workflows or generate images with specific requirements, you MUST call `recall_workflow` tool to find existing similar workflows.\n"
+    else:
+        w_inst = "**CASE 3: CREATE NEW / SEARCH WORKFLOW**\nIF the user wants to find or generate a NEW workflow from scratch.\n- Keywords: \"create\", \"generate\", \"search\", \"find\", \"recommend\", \"生成\", \"查找\", \"推荐\".\n- Action: Use `recall_workflow` AND `gen_workflow`.\n"
+        w_cons = "- [Critical!] When the user's intent is to get workflows or generate images with specific requirements, you MUST ALWAYS call BOTH recall_workflow tool AND gen_workflow tool to provide comprehensive workflow options. Never call just one of these tools - both are required for complete workflow assistance. First call recall_workflow to find existing similar workflows, then call gen_workflow to generate new workflow options.\n"
+
+    agent = create_agent(
+        name="ComfyUI-Copilot",
+        instructions=f"""You are a powerful AI assistant for designing image processing workflows, capable of automating problem-solving using tools and commands.
+
+When handing off to workflow rewrite agent or other agents, this session ID should be used for workflow data management.
+
+### PRIMARY DIRECTIVE: INTENT CLASSIFICATION & HANDOFF
+You act as a router. Your FIRST step is to classify the user's intent.
+
+### TOOL-CALL RELIABILITY OVERRIDE (CONTEXT-TRIM SAFE)
+The conversation history may be truncated for brevity and may contain ZERO tool calls/tool results.
+- You MUST NOT treat "no prior tool message" as a reason to skip tool usage.
+- If a CASE below requires a tool call or handoff, you MUST execute it even if you think you already know the answer.
+- If a CASE below requires a tool call or handoff, your IMMEDIATE next assistant turn MUST be that tool call/handoff (do not output any natural-language explanation first).
+
+**CASE 1: MODIFY/UPDATE/FIX CURRENT WORKFLOW (HIGHEST PRIORITY)**
+IF the user wants to:
+- Modify, enhance, update, or fix the CURRENT workflow/canvas.
+- Add nodes/features to the CURRENT workflow (e.g., "add LoRA", "add controlnet", "fix the error").
+- Change parameters in the CURRENT workflow.
+- Keywords: "modify", "update", "add", "change", "fix", "current", "canvas", "修改", "更新", "添加", "画布", "加一个", "换一个", "调一下".
+
+**ACTION:**
+- You MUST IMMEDIATELY handoff to the `Workflow Rewrite Agent`.
+- DO NOT call any other tools (like search_node, gen_workflow).
+- DO NOT ask for more details. Just handoff.
+
+**CASE 2: ANALYZE CURRENT WORKFLOW**
+IF the user wants to:
+- Analyze, explain, or understand the current workflow structure/logic.
+- Ask questions about the current workflow (e.g., "how does this work?", "explain the workflow").
+- Keywords: "analyze", "explain", "understand", "how it works", "workflow structure", "分析", "解释", "怎么工作的", "解读".
+
+**ACTION:
+- You MUST call `get_current_workflow` to retrieve the workflow details.
+- Then, based on the returned workflow data, provide a detailed analysis or explanation to the user.
+
+{w_inst}
+
+### CONSTRAINT CHECKLIST
+You must adhere to the following constraints to complete the task:
+
+- **Tool compliance is mandatory**: If the selected CASE requires a tool/handoff, you MUST perform it. Do not answer directly without performing the required tool/handoff.
+- [Important!] Respond must in the language used by the user in their question. Regardless of the language returned by the tools being called, please return the results based on the language used in the user's query. For example, if user ask by English, you must return
+- Ensure that the commands or tools you invoke are within the provided tool list.
+- If the execution of a command or tool fails, try changing the parameters or their format before attempting again.
+- Your generated responses must follow the factual information given above. Do not make up information.
+- If the result obtained is incorrect, try rephrasing your approach.
+- Do not query for already obtained information repeatedly. If you successfully invoked a tool and obtained relevant information, carefully confirm whether you need to invoke it again.
+- Ensure that the actions you generate can be executed accurately. Actions may include specific methods and target outputs.
+- When you encounter a concept, try to obtain its precise definition and analyze what inputs can yield specific values for it.
+- When generating a natural language query, include all known information in the query.
+- Before performing any analysis or calculation, ensure that all sub-concepts involved have been defined.
+- Printing the entire content of a file is strictly prohibited, as such actions have high costs and can lead to unforeseen consequences.
+- Ensure that when you call a tool, you have obtained all the input variables for that tool, and do not fabricate any input values for it.
+- Respond with markdown, using a minimum of 3 heading levels (H3, H4, H5...), and when including images use the format ![alt text](url),
+{w_cons}
+- When the user's intent is to query, return the query result directly without attempting to assist the user in performing operations.
+- When the user's intent is to get prompts for image generation (like Stable Diffusion). Use specific descriptive language with proper weight modifiers (e.g., (word:1.2)), prefer English terms, and separate elements with commas. Include quality terms (high quality, detailed), style specifications (realistic, anime), lighting (cinematic, golden hour), and composition (wide shot, close up) as needed. When appropriate, include negative prompts to exclude unwanted elements. Return words divided by commas directly without any additional text.
+- If you cannot find the information needed to answer a query, consider using bing_search to obtain relevant information. For example, if search_node tool cannot find the node, you can use bing_search to obtain relevant information about those nodes or components.
+- If search_node tool cannot find the node, you MUST use bing_search to obtain relevant information about those nodes or components.
+
+- **ERROR MESSAGE ANALYSIS** - When a user pastes specific error text/logs (containing terms like "Failed", "Error", "Traceback", or stack traces), prioritize providing troubleshooting help rather than invoking search tools. Follow these steps:
+  1. Analyze the error to identify the root cause (error type, affected component, missing dependencies, etc.)
+  2. Explain the issue in simple terms
+  3. Provide concrete, executable solutions including:
+     - Specific shell commands to fix the issue (e.g., `git pull`, `pip install`, file path corrections)
+     - Code snippets if applicable
+     - Configuration file changes with exact paths and values
+  4. If the error relates to a specific ComfyUI extension or node, include instructions for:
+     - Updating the extension (`cd path/to/extension && git pull`)
+     - Reinstalling dependencies
+     - Alternative approaches if the extension is problematic
+        """,
+        mcp_servers=server_list,
+        handoffs=[handoff_rewrite],
+        tools=[get_current_workflow],
+        config=config,
+    )
+
+    return exit_stack, server_list, agent
+
+# 4. Stream LLM Response
+class InvokeState:
+    def __init__(self):
+        self.current_text = ""
+        self.ext = None
+        self.tool_results = {}
+        self.workflow_tools_called = set()
+        self.last_yield_length = 0
+        self.tool_call_queue = []
+        self.current_tool_call = None
+        self.workflow_update_ext = None
+        self.handoff_occurred = False
+
+async def _stream_llm_response(agent, messages: List[Dict[str, Any]]):
+    from agents import Runner, set_tracing_disabled, set_default_openai_api
+    set_tracing_disabled(False)
+    set_default_openai_api("chat_completions")
+
+    state = InvokeState()
+
+    async def process_stream_events(stream_result):
+        try:
+            async for event in stream_result.stream_events():
+                if event.type == "raw_response_event" and isinstance(event.data, ResponseTextDeltaEvent):
+                    delta_text = event.data.delta
+                    if delta_text:
+                        state.current_text += delta_text
+                        if len(state.current_text) > state.last_yield_length:
+                            state.last_yield_length = len(state.current_text)
+                            yield (state.current_text, None)
+
+                elif event.type == "agent_updated_stream_event":
+                    new_agent_name = event.new_agent.name
+                    log.info(f"Handoff to: {new_agent_name}")
+                    if state.handoff_occurred:
+                        handoff_text = f"\n▸ **Switching to {new_agent_name}**\n\n"
+                        state.current_text += handoff_text
+                        state.last_yield_length = len(state.current_text)
+                        yield (state.current_text, None)
+                    state.handoff_occurred = True
+
+                elif event.type == "run_item_stream_event":
+                    if event.item.type == "tool_call_item":
+                        tool_name = getattr(event.item.raw_item, "name", "unknown_tool")
+                        state.tool_call_queue.append(tool_name)
+                        log.info(f"-- Tool '{tool_name}' was called")
+                        if tool_name in ["recall_workflow", "gen_workflow"]:
+                            state.workflow_tools_called.add(tool_name)
+
+                    elif event.item.type == "tool_call_output_item":
+                        log.info(f"-- Tool output: {event.item.output}")
+                        tool_output_data_str = str(event.item.output)
+
+                        tool_name = state.tool_call_queue.pop(0) if state.tool_call_queue else "unknown_tool"
+
+                        try:
+                            if isinstance(event.item.output, dict):
+                                tool_output_data = event.item.output
+                            elif isinstance(event.item.output, str):
+                                tool_output_data = json.loads(event.item.output)
+                            else:
+                                tool_output_data = json.loads(str(event.item.output))
+
+                            if "result" in tool_output_data and isinstance(tool_output_data["result"], str):
+                                try:
+                                    tool_output_data = json.loads(tool_output_data["result"])
+                                except json.JSONDecodeError:
+                                    tool_output_data = {"text": tool_output_data["result"]}
+
+                            if "ext" in tool_output_data and tool_output_data["ext"]:
+                                tool_ext_items = tool_output_data["ext"]
+                                for ext_item in tool_ext_items:
+                                    if ext_item.get("type") in {"workflow_update", "param_update", "workflow"}:
+                                        state.workflow_update_ext = tool_ext_items
+                                        log.info(f"-- Captured workflow tool ext from tool output: {len(tool_ext_items)} items")
+                                        break
+
+                            if "text" in tool_output_data and tool_output_data.get("text"):
+                                parsed_output = json.loads(tool_output_data["text"])
+                                if isinstance(parsed_output, dict):
+                                    answer = parsed_output.get("answer")
+                                    data = parsed_output.get("data")
+                                    tool_ext = parsed_output.get("ext")
+                                else:
+                                    answer = None
+                                    data = parsed_output if isinstance(parsed_output, list) else None
+                                    tool_ext = None
+
+                                state.tool_results[tool_name] = {
+                                    "answer": answer, "data": data, "ext": tool_ext, "content_dict": parsed_output,
+                                }
+                        except (json.JSONDecodeError, TypeError):
+                            state.tool_results[tool_name] = {
+                                "answer": tool_output_data_str, "data": None, "ext": None, "content_dict": None,
+                            }
+        except Exception as e:
+            log.error(f"Unexpected streaming error: {e}")
+            raise e
+
+    retry_count = 0
+    max_retries = 3
+    while retry_count <= max_retries:
+        try:
+            result = Runner.run_streamed(agent, input=messages, max_turns=30)
+            async for stream_chunk in process_stream_events(result):
+                yield stream_chunk, None
+            break
+        except RateLimitError as rl_err:
+            error_body = getattr(rl_err, "body", {})
+            error_msg = error_body.get("message") if isinstance(error_body, dict) else None
+            final_error_msg = error_msg or "Rate limit exceeded, please try again later."
+            yield (final_error_msg, None), None
+            return
+        except (AttributeError, TypeError, ConnectionError, OSError) as stream_error:
+            error_msg = str(stream_error)
+            should_retry = "'NoneType' object has no attribute 'strip'" in error_msg or "Connection broken" in error_msg or "socket hang up" in error_msg
+            retry_count += 1
+            if should_retry and retry_count <= max_retries:
+                if state.current_text:
+                    yield (state.current_text, None), None
+                await asyncio.sleep(min(2 ** (retry_count - 1), 10))
+            else:
+                yield (f"I apologize, but an error occurred while processing your request: {error_msg}", None), None
+                return
+        except Exception:
+            retry_count += 1
+            if retry_count > max_retries:
+                break
+            await asyncio.sleep(1)
+
+    yield None, state
+
+# 5. Handle Invoke Error
+def _handle_invoke_error(error: Exception) -> tuple[str, dict]:
+    log.error(f"Error in comfyui_agent_invoke: {error}")
+    log.error(f"Traceback: {traceback.format_exc()}")
+    return (str(error), {"data": None, "finished": True})
+
+# 6. Final Build
+def _build_invoke_response(state: InvokeState, bridged_pseudo_tools: bool) -> tuple[str, dict]:
+    # Error fallback if needed
+    if bridged_pseudo_tools and not state.current_text:
+        failed_tools = [n for n in sorted(state.tool_results.keys()) if n != "_message_output_ext" and not (state.tool_results[n].get("data") or state.tool_results[n].get("answer"))]
+        state.current_text = f"(도구 호출 {', '.join(failed_tools)} 이(가) 결과를 반환하지 못했습니다. 잠시 후 재시도해 주세요.)" if failed_tools else "(도구 호출은 처리했지만 사용자에게 보여줄 텍스트가 없습니다.)"
+
+    workflow_tools_found = [t for t in ["recall_workflow", "gen_workflow"] if t in state.tool_results]
+    finished = False
+    ext = None
+
+    if workflow_tools_found:
+        if "recall_workflow" in state.tool_results and "gen_workflow" in state.tool_results:
+            successful_workflows = []
+            if state.tool_results["recall_workflow"]["data"]:
+                successful_workflows.extend(state.tool_results["recall_workflow"]["data"])
+            if state.tool_results["gen_workflow"]["data"]:
+                successful_workflows.insert(0, *state.tool_results["gen_workflow"]["data"])
+
+            seen_ids = set()
+            unique_workflows = []
+            for w in successful_workflows:
+                wid = w.get("id")
+                if wid and wid not in seen_ids:
+                    seen_ids.add(wid)
+                    unique_workflows.append(w)
+                elif not wid:
+                    unique_workflows.append(w)
+
+            if unique_workflows:
+                ext = [{"type": "workflow", "data": unique_workflows}]
+            finished = True
+        elif "recall_workflow" in state.tool_results:
+            if DISABLE_WORKFLOW_GEN:
+                if state.tool_results["recall_workflow"]["data"]:
+                    ext = [{"type": "workflow", "data": state.tool_results["recall_workflow"]["data"]}]
+                finished = True
+        elif "gen_workflow" in state.tool_results:
+            if state.tool_results["gen_workflow"]["data"]:
+                    ext = [{"type": "workflow", "data": state.tool_results["gen_workflow"]["data"]}]
+            finished = True
+    else:
+        for tn, res in state.tool_results.items():
+            if res["ext"]:
+                ext = res["ext"]
+                break
+        finished = True
+
+    final_ext = ext
+    if state.workflow_update_ext:
+        if isinstance(state.workflow_update_ext, list):
+            final_ext = state.workflow_update_ext + (ext if ext else [])
+        else:
+            final_ext = [state.workflow_update_ext] + (ext if ext else [])
+
+    return (state.current_text, {"data": final_ext, "finished": finished})
+
+# Main Orchestrator Function
+async def _new_comfyui_agent_invoke(messages: List[Dict[str, Any]], images: List[ImageData] = None):
+    # Note: `images` is kept in signature for compatibility with conversational_api.py,
+    # but it's not directly used here since images are already formatted inside `messages` by the caller.
+    try:
+        session_id, config = _validate_invoke_input()
+        messages, handled, early_result = await _prepare_invoke_context(messages, session_id)
+        if handled:
+            yield early_result
+            return
+
+        exit_stack, server_list, agent = await _setup_tool_loop(messages, session_id, config)
+        try:
+            state = None
+            async for chunk, s in _stream_llm_response(agent, messages):
+                if chunk:
+                    yield chunk
+                if s:
+                    state = s
+
+            if state is None:
+                state = InvokeState()
+
+            state.current_text, state.workflow_update_ext, bridged = await _bridge_pseudo_tool_calls(
+                current_text=state.current_text, server_list=server_list, tool_results=state.tool_results,
+                workflow_tools_called=state.workflow_tools_called, workflow_update_ext=state.workflow_update_ext
+            )
+
+            yield _build_invoke_response(state, bridged)
+        finally:
+            await exit_stack.aclose()
+    except Exception as e:
+        yield _handle_invoke_error(e)
+
+
+async def _legacy_comfyui_agent_invoke(
     messages: List[Dict[str, Any]], images: List[ImageData] = None
 ):
     """
@@ -666,28 +1139,50 @@ async def comfyui_agent_invoke(
         if not session_id:
             raise ValueError("No session_id found in request context")
 
-        # Only low-risk conversational chat should bypass the local tool/execution path.
+        last_user_msg = _latest_user_message_text(messages)
         # Action-oriented requests (generation, workflow edits, diagnostics) must stay on
         # the local Copilot path so workflow ext data can flow back into ComfyUI.
-        last_user_msg = _latest_user_message_text(messages)
-        if _should_passthrough_rag_agent(messages, images):
-            try:
-                log.info(
-                    f"[MCP] Routing simple chat directly to RAG agent for query: {last_user_msg}"
-                )
-                response_text = await pass_through_rag_agent(
-                    last_user_msg, session_id=session_id
-                )
-                ext_with_finished = {"data": None, "finished": True}
-                yield (response_text, ext_with_finished)
-                return
-            except Exception as e:
-                log.error(f"[MCP] Error passing to RAG agent: {e}")
-                # Fall back to local execution if pass-through fails.
-        elif last_user_msg:
-            log.info(
-                f"[MCP] Keeping local tool path for action-oriented query: {last_user_msg[:160]}"
+        if last_user_msg:
+            # Simple heuristic intent classification
+            gen_keywords = [
+                "만들",
+                "생성",
+                "그려",
+                "추가",
+                "바꿔",
+                "수정",
+                "create",
+                "generate",
+                "draw",
+                "추천",
+                "workflow",
+                "워크플로우",
+                "변경",
+                "해줘",
+            ]
+            is_generation_intent = any(
+                kw in last_user_msg.lower() for kw in gen_keywords
             )
+
+            if not is_generation_intent:
+                # Only low-risk conversational chat should bypass the local tool/execution path.
+                try:
+                    log.info(
+                        f"[MCP] Routing simple chat directly to RAG agent for query: {last_user_msg}"
+                    )
+                    response_text = await pass_through_rag_agent(
+                        last_user_msg, session_id=session_id
+                    )
+                    ext_with_finished = {"data": None, "finished": True}
+                    yield (response_text, ext_with_finished)
+                    return
+                except Exception as e:
+                    log.error(f"[MCP] Error passing to RAG agent: {e}")
+                    # Fall back to local execution if pass-through fails.
+            else:
+                log.info(
+                    f"[MCP] Keeping local tool path for action-oriented query: {last_user_msg[:160]}"
+                )
 
         def _strip_trailing_whitespace_from_messages(
             msgs: List[Dict[str, Any]],
@@ -982,9 +1477,7 @@ You must adhere to the following constraints to complete the task:
             log.info(f"-- Processing {len(messages)} messages")
 
             from agents import (
-                Agent,
                 Runner,
-                set_trace_processors,
                 set_tracing_disabled,
                 set_default_openai_api,
             )
@@ -1008,8 +1501,7 @@ You must adhere to the following constraints to complete the task:
             workflow_tools_called = set()  # Track called workflow tools
             last_yield_length = 0
             tool_call_queue = []  # Queue to track tool calls in order
-            current_tool_call = None  # Track current tool being called
-            # Collect workflow update ext data from tools and message outputs
+                        # Collect workflow update ext data from tools and message outputs
             workflow_update_ext = None
             # Track if we've seen any handoffs to avoid showing initial handoff
             handoff_occurred = False
@@ -1094,13 +1586,35 @@ You must adhere to the following constraints to complete the task:
                                 else:
                                     tool_name = "unknown_tool"
                                     log.info(
-                                        f"-- Warning: No tool call in queue for output"
+                                        "-- Warning: No tool call in queue for output"
                                     )
 
                                 try:
                                     import json
 
-                                    tool_output_data = json.loads(tool_output_data_str)
+                                    # event.item.output might already be a dict or a string
+                                    if isinstance(event.item.output, dict):
+                                        tool_output_data = event.item.output
+                                    elif isinstance(event.item.output, str):
+                                        tool_output_data = json.loads(event.item.output)
+                                    else:
+                                        tool_output_data = json.loads(
+                                            str(event.item.output)
+                                        )
+
+                                    if "result" in tool_output_data and isinstance(
+                                        tool_output_data["result"], str
+                                    ):
+                                        try:
+                                            # Unwrap FastMCP "result" wrapper
+                                            tool_output_data = json.loads(
+                                                tool_output_data["result"]
+                                            )
+                                        except json.JSONDecodeError:
+                                            tool_output_data = {
+                                                "text": tool_output_data["result"]
+                                            }
+
                                     if (
                                         "ext" in tool_output_data
                                         and tool_output_data["ext"]
@@ -1108,12 +1622,11 @@ You must adhere to the following constraints to complete the task:
                                         # Store all ext items from tool output, not just workflow_update
                                         tool_ext_items = tool_output_data["ext"]
                                         for ext_item in tool_ext_items:
-                                            if (
-                                                ext_item.get("type")
-                                                == "workflow_update"
-                                                or ext_item.get("type")
-                                                == "param_update"
-                                            ):
+                                            if ext_item.get("type") in {
+                                                "workflow_update",
+                                                "param_update",
+                                                "workflow",
+                                            }:
                                                 workflow_update_ext = tool_ext_items  # Store all ext items, not just one
                                                 log.info(
                                                     f"-- Captured workflow tool ext from tool output: {len(tool_ext_items)} items"
@@ -1247,15 +1760,9 @@ You must adhere to the following constraints to complete the task:
                         )
                         log.error(f"Traceback: {traceback.format_exc()}")
                         if isinstance(stream_error, RateLimitError):
-                            default_error_msg = (
-                                "Rate limit exceeded, please try again later."
-                            )
-                            error_body = stream_error.body
-                            error_msg = (
-                                error_body["message"]
-                                if error_body and "message" in error_body
-                                else None
-                            )
+                            default_error_msg = "Rate limit exceeded, please try again later."
+                            error_body = getattr(stream_error, "body", {})
+                            error_msg = error_body.get("message") if isinstance(error_body, dict) else None
                             final_error_msg = error_msg or default_error_msg
                             yield (final_error_msg, None)
                             return
@@ -1352,7 +1859,7 @@ You must adhere to the following constraints to complete the task:
                 log.info(
                     f"  - Answer preview: {result['answer'][:100] if result['answer'] else 'None'}..."
                 )
-            log.info(f"=== End Tool Results Summary ===\n")
+            log.info("=== End Tool Results Summary ===\n")
 
             # Process workflow tools results integration similar to reference facade.py
             workflow_tools_found = [
@@ -1543,7 +2050,7 @@ You must adhere to the following constraints to complete the task:
         if is_retryable_streaming_error:
             # For retryable streaming errors, don't finish - allow user to retry
             log.info(
-                f"Detected retryable streaming error, setting finished=False to allow retry"
+                "Detected retryable streaming error, setting finished=False to allow retry"
             )
             error_ext = {"data": None, "finished": False}
             error_message = f"A temporary streaming error occurred: {str(e)}. Please try your request again."
