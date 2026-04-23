@@ -806,6 +806,25 @@ async def _setup_tool_loop(messages: List[Dict[str, Any]], session_id: str, conf
         w_inst = "**CASE 3: CREATE NEW / SEARCH WORKFLOW**\nIF the user wants to find or generate a NEW workflow from scratch.\n- Keywords: \"create\", \"generate\", \"search\", \"find\", \"recommend\", \"生成\", \"查找\", \"推荐\".\n- Action: Use `recall_workflow` AND `gen_workflow`.\n"
         w_cons = "- [Critical!] When the user's intent is to get workflows or generate images with specific requirements, you MUST ALWAYS call BOTH recall_workflow tool AND gen_workflow tool to provide comprehensive workflow options. Never call just one of these tools - both are required for complete workflow assistance. First call recall_workflow to find existing similar workflows, then call gen_workflow to generate new workflow options.\n"
 
+    # WO-COPILOT-IMAGE-GEN-HOTFIX-MCP-CLIENT §4.A — action-path model override.
+    # Why: chat dropdown model_select (e.g. qwen-coder) otherwise leaks into image/workflow
+    # action path and overrides workflow_llm_model, triggering context-length failures.
+    # HOTFIX scope: on action path, workflow_llm_model unconditionally wins. Proper 2-key
+    # split (chat_model_select vs workflow_llm_model) lives in WO-COPILOT-MODEL-CONTRACT-SPLIT.
+    effective_config = dict(config or {})
+    _last_user_for_path = _latest_user_message_text(messages)
+    if _last_user_for_path:
+        _gen_kw = ["만들", "생성", "그려", "추가", "바꿔", "수정", "create", "generate", "draw", "추천", "workflow", "워크플로우", "변경", "해줘"]
+        _is_action_path = any(k in _last_user_for_path.lower() for k in _gen_kw)
+    else:
+        _is_action_path = False
+    if _is_action_path and effective_config.get("workflow_llm_model"):
+        _orig_sel = effective_config.get("model_select")
+        effective_config["model_select"] = effective_config["workflow_llm_model"]
+        log.info(
+            f"[MCP] Action-path model override: model_select {_orig_sel!r} -> workflow_llm_model {effective_config['model_select']!r} [WO-HOTFIX-A]"
+        )
+
     agent = create_agent(
         name="ComfyUI-Copilot",
         instructions=f"""You are a powerful AI assistant for designing image processing workflows, capable of automating problem-solving using tools and commands.
@@ -883,7 +902,7 @@ You must adhere to the following constraints to complete the task:
         mcp_servers=server_list,
         handoffs=[handoff_rewrite],
         tools=[get_current_workflow],
-        config=config,
+        config=effective_config,
     )
 
     return exit_stack, server_list, agent
@@ -900,6 +919,30 @@ class InvokeState:
         self.current_tool_call = None
         self.workflow_update_ext = None
         self.handoff_occurred = False
+        # WO-COPILOT-IMAGE-GEN-HOTFIX-MCP-CLIENT §4.C: terminal error surfacing
+        self.all_retries_failed = False
+        self.last_error_info = None  # dict: {error_class, stage, model, detail}
+
+
+def _hotfix_extract_model_name(agent, config_hint=None) -> str:
+    """WO-HOTFIX §4.C helper: best-effort model name for user-facing error text."""
+    import os as _os
+    for attr_path in ("config", "model", "model_select"):
+        try:
+            val = getattr(agent, attr_path, None)
+            if isinstance(val, dict):
+                m = val.get("model_select") or val.get("workflow_llm_model") or val.get("model")
+                if m:
+                    return str(m)
+            elif isinstance(val, str) and val:
+                return val
+        except Exception:
+            pass
+    if isinstance(config_hint, dict):
+        m = config_hint.get("model_select") or config_hint.get("workflow_llm_model")
+        if m:
+            return str(m)
+    return _os.getenv("WORKFLOW_LLM_MODEL") or _os.getenv("OPENAI_MODEL") or "unknown"
 
 async def _stream_llm_response(agent, messages: List[Dict[str, Any]]):
     from agents import Runner, set_tracing_disabled, set_default_openai_api
@@ -990,6 +1033,11 @@ async def _stream_llm_response(agent, messages: List[Dict[str, Any]]):
     retry_count = 0
     max_retries = 3
     while retry_count <= max_retries:
+        # WO-COPILOT-IMAGE-GEN-HOTFIX-MCP-CLIENT §4.B — reset per iteration so the
+        # initial Handoff event of each retry does NOT emit a "▸ Switching to ..."
+        # banner. handoff_occurred is the only per-attempt flag; current_text /
+        # tool_results / workflow_update_ext must stay cumulative for partial progress.
+        state.handoff_occurred = False
         try:
             result = Runner.run_streamed(agent, input=messages, max_turns=30)
             async for stream_chunk in process_stream_events(result):
@@ -999,7 +1047,16 @@ async def _stream_llm_response(agent, messages: List[Dict[str, Any]]):
             error_body = getattr(rl_err, "body", {})
             error_msg = error_body.get("message") if isinstance(error_body, dict) else None
             final_error_msg = error_msg or "Rate limit exceeded, please try again later."
+            # WO-HOTFIX §4.C
+            state.all_retries_failed = True
+            state.last_error_info = {
+                "error_class": "rate_limit",
+                "stage": "llm_router_call",
+                "model": _hotfix_extract_model_name(agent),
+                "detail": final_error_msg,
+            }
             yield (final_error_msg, None), None
+            yield None, state  # WO-HOTFIX §4.C — propagate state to caller before exit
             return
         except (AttributeError, TypeError, ConnectionError, OSError) as stream_error:
             error_msg = str(stream_error)
@@ -1010,11 +1067,32 @@ async def _stream_llm_response(agent, messages: List[Dict[str, Any]]):
                     yield (state.current_text, None), None
                 await asyncio.sleep(min(2 ** (retry_count - 1), 10))
             else:
+                # WO-HOTFIX §4.C — terminal error: record so _build_invoke_response can surface it
+                _err_class = type(stream_error).__name__
+                if "context_length" in error_msg.lower() or "context length" in error_msg.lower():
+                    _err_class = "context_length_exceeded"
+                elif "connection" in error_msg.lower():
+                    _err_class = "connection"
+                state.all_retries_failed = True
+                state.last_error_info = {
+                    "error_class": _err_class,
+                    "stage": "llm_router_call",
+                    "model": _hotfix_extract_model_name(agent),
+                    "detail": error_msg,
+                }
                 yield (f"I apologize, but an error occurred while processing your request: {error_msg}", None), None
+                yield None, state  # WO-HOTFIX §4.C — propagate state to caller before exit
                 return
-        except Exception:
+        except Exception as _exc:  # WO-HOTFIX §4.C — capture last error on exhaustion
             retry_count += 1
             if retry_count > max_retries:
+                state.all_retries_failed = True
+                state.last_error_info = {
+                    "error_class": type(_exc).__name__,
+                    "stage": "llm_router_call",
+                    "model": _hotfix_extract_model_name(agent),
+                    "detail": str(_exc),
+                }
                 break
             await asyncio.sleep(1)
 
@@ -1028,6 +1106,20 @@ def _handle_invoke_error(error: Exception) -> tuple[str, dict]:
 
 # 6. Final Build
 def _build_invoke_response(state: InvokeState, bridged_pseudo_tools: bool) -> tuple[str, dict]:
+    # WO-COPILOT-IMAGE-GEN-HOTFIX-MCP-CLIENT §4.C — surface terminal LLM error with
+    # error_class + model + stage so users see a clear diagnostic instead of ext=null.
+    if getattr(state, "all_retries_failed", False) and getattr(state, "last_error_info", None):
+        _info = state.last_error_info
+        _err_text = (
+            f"⚠️ LLM 호출 실패: {_info.get('model', 'unknown')} — "
+            f"{_info.get('error_class', 'unknown_error')} ({_info.get('stage', 'unknown_stage')}). "
+            f"재시도하거나 모델을 바꿔주세요."
+        )
+        _detail = _info.get("detail")
+        if _detail:
+            _err_text += f"\n\n<details><summary>details</summary>\n{_detail}\n</details>"
+        return (_err_text, {"data": None, "finished": True})
+
     # Error fallback if needed
     if bridged_pseudo_tools and not state.current_text:
         failed_tools = [n for n in sorted(state.tool_results.keys()) if n != "_message_output_ext" and not (state.tool_results[n].get("data") or state.tool_results[n].get("answer"))]
